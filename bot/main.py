@@ -1,7 +1,7 @@
 """Second Brain Telegram bot.
 
-Ingests URLs (web articles / YouTube) or plain text into `raw/`, asks Gemini to
-maintain the LLM Wiki in `wiki/` according to `AGENTS.md`, then commits and pushes.
+Ingests URLs (web articles / YouTube) or plain text into `raw/`, asks OpenRouter
+to maintain the LLM Wiki in `wiki/` according to `AGENTS.md`, then commits and pushes.
 """
 
 from __future__ import annotations
@@ -16,7 +16,9 @@ import sys
 import unicodedata
 from datetime import date
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 import truststore
 
@@ -25,8 +27,7 @@ truststore.inject_into_ssl()
 
 import trafilatura  # noqa: E402
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from telegram import Update
 from telegram.constants import ChatAction
@@ -53,11 +54,22 @@ load_dotenv(REPO_ROOT / ".env")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0") or 0)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+DEFAULT_OPENROUTER_MODELS = (
+    "google/gemini-4-carbon",
+    "openai/gpt-6.2-sol",
+    "anthropic/claude-fable-5.2",
+)
+OPENROUTER_MODELS = tuple(
+    model.strip()
+    for model in os.environ.get(
+        "OPENROUTER_MODELS", ",".join(DEFAULT_OPENROUTER_MODELS)
+    ).split(",")
+    if model.strip()
+)
 GIT_PUSH = os.environ.get("GIT_PUSH", "true").lower() in {"1", "true", "yes"}
 
-MAX_SOURCE_CHARS = 200_000  # safety cap on the text sent to Gemini
+MAX_SOURCE_CHARS = 200_000  # safety cap on the text sent to the model provider
 MAX_QUERY_FILES = 8
 TELEGRAM_LIMIT = 4000
 
@@ -77,7 +89,14 @@ log = logging.getLogger("second-brain")
 # Serialize ingestions so concurrent messages don't race on files / git.
 INGEST_LOCK = asyncio.Lock()
 
-gemini = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+openrouter = (
+    AsyncOpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    if OPENROUTER_API_KEY
+    else None
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,18 +105,81 @@ gemini = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 class WikiFile(BaseModel):
+    model_config = {"extra": "forbid"}
+
     filename: str = Field(description="File name inside wiki/, kebab-case, ending in .md, e.g. 'spaced-repetition.md'")
     content: str = Field(description="Full final markdown content including YAML frontmatter")
 
 
 class IngestResult(BaseModel):
+    model_config = {"extra": "forbid"}
+
     files: list[WikiFile] = Field(description="Wiki notes to create or update (not index.md)")
     index_md: str = Field(description="Full updated content of wiki/index.md")
     summary_he: str = Field(description="Concise summary in Hebrew for the Telegram reply")
 
 
 class FileSelection(BaseModel):
+    model_config = {"extra": "forbid"}
+
     filenames: list[str] = Field(description="Most relevant wiki filenames from the index, e.g. 'foo.md'")
+
+
+ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+
+
+def _fallback_request_options(
+    *, require_parameters: bool = False
+) -> dict[str, object] | None:
+    options: dict[str, object] = {}
+    fallbacks = list(OPENROUTER_MODELS[1:])
+    if fallbacks:
+        options["models"] = fallbacks
+    if require_parameters:
+        options["provider"] = {"require_parameters": True}
+    return options or None
+
+
+async def openrouter_structured(
+    prompt: str, response_model: type[ResponseModel], temperature: float
+) -> ResponseModel:
+    if openrouter is None:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    response = await openrouter.chat.completions.create(
+        model=OPENROUTER_MODELS[0],
+        messages=[{"role": "user", "content": prompt}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": response_model.__name__.lower(),
+                "strict": True,
+                "schema": response_model.model_json_schema(),
+            },
+        },
+        temperature=temperature,
+        extra_body=_fallback_request_options(require_parameters=True),
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError("OpenRouter returned an empty structured response")
+    log.info("OpenRouter used model %s", response.model)
+    return response_model.model_validate_json(content)
+
+
+async def openrouter_text(prompt: str, temperature: float) -> str:
+    if openrouter is None:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    response = await openrouter.chat.completions.create(
+        model=OPENROUTER_MODELS[0],
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        extra_body=_fallback_request_options(),
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError("OpenRouter returned an empty response")
+    log.info("OpenRouter used model %s", response.model)
+    return content
 
 
 # --------------------------------------------------------------------------- #
@@ -203,21 +285,54 @@ def extract_youtube(url: str, video_id: str) -> tuple[str, str]:
 
 
 def extract_article(url: str) -> tuple[str, str]:
+    def parse_article(html: str | None) -> tuple[str, str] | None:
+        if not html:
+            return None
+        text = trafilatura.extract(
+            html,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            favor_recall=True,
+        )
+        if not text:
+            return None
+        meta = trafilatura.extract_metadata(html)
+        title = meta.title if meta and meta.title else urlparse(url).netloc
+        return title, text
+
     downloaded = trafilatura.fetch_url(url)
-    if not downloaded:
-        raise RuntimeError("לא הצלחתי להוריד את הדף.")
-    text = trafilatura.extract(
-        downloaded,
-        output_format="markdown",
-        include_links=True,
-        include_tables=True,
-        favor_recall=True,
+    parsed = parse_article(downloaded)
+    if parsed:
+        return parsed
+
+    # Retry even if the first request returned content: some sites return a
+    # challenge or malformed page that downloads successfully but won't parse.
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+        },
     )
-    if not text:
-        raise RuntimeError("לא הצלחתי לחלץ טקסט מהדף.")
-    meta = trafilatura.extract_metadata(downloaded)
-    title = meta.title if meta and meta.title else urlparse(url).netloc
-    return title, text
+    try:
+        with urlopen(request, timeout=30) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            downloaded = response.read().decode(charset, errors="replace")
+    except Exception as exc:  # noqa: BLE001 - report the URL download failure
+        raise RuntimeError(f"לא הצלחתי להוריד את הדף: {exc}") from exc
+
+    parsed = parse_article(downloaded)
+    if not parsed:
+        raise RuntimeError(
+            "הדף ירד, אבל לא הצלחתי לחלץ ממנו טקסט. "
+            "ייתכן שהוא דורש JavaScript או חסום לבוטים; אפשר לשלוח את הטקסט ישירות."
+        )
+    return parsed
 
 
 def extract_content(message: str) -> dict:
@@ -258,11 +373,11 @@ def save_raw(content: dict) -> tuple[Path, str]:
 
 
 # --------------------------------------------------------------------------- #
-# Gemini
+# OpenRouter
 # --------------------------------------------------------------------------- #
 
 
-async def gemini_ingest(raw_path: Path) -> IngestResult:
+async def openrouter_ingest(raw_path: Path) -> IngestResult:
     agents = read_text(AGENTS_FILE)
     index = read_text(INDEX_FILE)
     raw_rel = raw_path.relative_to(REPO_ROOT).as_posix()
@@ -272,7 +387,7 @@ async def gemini_ingest(raw_path: Path) -> IngestResult:
     existing_names = sorted(p.name for p in WIKI_DIR.glob("*.md") if p.name != "index.md")
     existing_notes = ""
     if existing_names:
-        selection = await gemini_select_files(
+        selection = await openrouter_select_files(
             f"Which existing notes are related to this new source?\n\n{raw_content[:8000]}",
             index,
         )
@@ -314,43 +429,24 @@ Tasks:
    or updated note, preserving all existing entries.
 3. Write a concise summary of the source in Hebrew (3-6 sentences) for a Telegram reply.
 """
-    response = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=IngestResult,
-            temperature=0.3,
-        ),
-    )
-    if response.parsed is not None:
-        return response.parsed
-    return IngestResult.model_validate_json(response.text)
+    return await openrouter_structured(prompt, IngestResult, temperature=0.3)
 
 
-async def gemini_select_files(question: str, index: str) -> list[str]:
+async def openrouter_select_files(question: str, index: str) -> list[str]:
     if not index.strip():
         return []
-    response = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=(
-            f"Wiki index:\n{index}\n\n{question}\n\n"
-            f"Return up to {MAX_QUERY_FILES} filenames (with .md) of the most relevant notes. "
-            "Return an empty list if none are relevant."
-        ),
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=FileSelection,
-            temperature=0,
-        ),
+    prompt = (
+        f"Wiki index:\n{index}\n\n{question}\n\n"
+        f"Return up to {MAX_QUERY_FILES} filenames (with .md) of the most relevant notes. "
+        "Return an empty list if none are relevant."
     )
-    parsed = response.parsed or FileSelection.model_validate_json(response.text)
+    parsed = await openrouter_structured(prompt, FileSelection, temperature=0)
     return parsed.filenames[:MAX_QUERY_FILES]
 
 
-async def gemini_answer(question: str) -> str:
+async def openrouter_answer(question: str) -> str:
     index = read_text(INDEX_FILE)
-    names = await gemini_select_files(f"Question: {question}", index)
+    names = await openrouter_select_files(f"Question: {question}", index)
     notes = ""
     for name in names:
         p = safe_wiki_path(name)
@@ -370,12 +466,7 @@ the answer, say so clearly in Hebrew.
 
 Question: {question}
 """
-    response = await gemini.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.2),
-    )
-    return response.text or "לא התקבלה תשובה."
+    return await openrouter_text(prompt, temperature=0.2)
 
 
 # --------------------------------------------------------------------------- #
@@ -439,8 +530,8 @@ async def ingest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             raw_path, slug = await asyncio.to_thread(save_raw, content)
             log.info("Saved raw source %s", raw_path.name)
 
-            await status.edit_text("🧠 מעדכן את הוויקי עם Gemini...")
-            result = await gemini_ingest(raw_path)
+            await status.edit_text("🧠 מעדכן את הוויקי עם OpenRouter...")
+            result = await openrouter_ingest(raw_path)
 
             written: list[str] = []
             skipped: list[str] = []
@@ -487,7 +578,7 @@ async def query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
-        answer = await gemini_answer(question)
+        answer = await openrouter_answer(question)
     except Exception as exc:  # noqa: BLE001
         log.exception("Query failed")
         await update.effective_message.reply_text(f"❌ שגיאה: {exc}")
@@ -501,10 +592,12 @@ def main() -> None:
         for name, value in {
             "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
             "ALLOWED_USER_ID": ALLOWED_USER_ID,
-            "GEMINI_API_KEY": GEMINI_API_KEY,
+            "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
         }.items()
         if not value
     ]
+    if not OPENROUTER_MODELS:
+        missing.append("OPENROUTER_MODELS")
     if missing:
         raise SystemExit(f"Missing required settings in .env: {', '.join(missing)}")
 

@@ -1,5 +1,5 @@
 python-telegram-bot>=21.6,<23
-google-genai>=1.20
+openai>=1.68,<3
 trafilatura>=2.0
 youtube-transcript-api>=1.2
 python-dotenv>=1.0
