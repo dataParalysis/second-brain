@@ -18,7 +18,12 @@ from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import trafilatura
+import truststore
+
+# Trust the OS certificate store (needed behind corporate TLS-inspecting proxies).
+truststore.inject_into_ssl()
+
+import trafilatura  # noqa: E402
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types

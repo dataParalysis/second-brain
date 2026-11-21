@@ -4,3 +4,4 @@ trafilatura>=2.0
 youtube-transcript-api>=1.2
 python-dotenv>=1.0
 pydantic>=2.7
+truststore>=0.10
